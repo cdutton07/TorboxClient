@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 // @ts-ignore: listen types
 import { listen } from "@tauri-apps/api/event";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import "./App.css";
 
 type AppSettings = {
@@ -22,6 +23,21 @@ type StartDownloadRequest = {
   asQueued?: boolean;
 };
 
+type StartLinkRequest = {
+  magnetLink?: string;
+  torrentFileName?: string;
+  torrentFileBytes?: number[];
+  suggestedFileName?: string;
+  allowZip?: boolean;
+  asQueued?: boolean;
+};
+
+type LinkRequestResult = {
+  torrentId: string;
+  downloadUrl: string;
+  detail: string;
+};
+
 type DownloadResult = {
   torrentId: string;
   outputPath: string;
@@ -29,11 +45,11 @@ type DownloadResult = {
   detail: string;
 };
 
-type DownloadEntry = {
+type RequestEntry = {
   id: string;
   status: "in-progress" | "completed" | "failed";
   statusMessage: string;
-  result: DownloadResult | null;
+  result: DownloadResult | LinkRequestResult | null;
   createdAt: number;
   bytesDownloaded: number;
   totalBytes: number;
@@ -70,11 +86,10 @@ function App() {
   const [suggestedFileName, setSuggestedFileName] = useState("");
   const [destinationFolder, setDestinationFolder] = useState("");
 
-  const [isDownloading, setIsDownloading] = useState(false);
+  const [isWorking, setIsWorking] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
-  const [downloads, setDownloads] = useState<DownloadEntry[]>([]);
+  const [downloads, setDownloads] = useState<RequestEntry[]>([]);
 
-  // Hydrate settings on mount
   // Hydrate settings on mount
   useEffect(() => {
     let cancelled = false;
@@ -185,6 +200,82 @@ function App() {
     setTorrentFileBytes(bytes);
   }
 
+  async function startRequestLink() {
+    if (!settings.bearerToken.trim()) {
+      alert("Please configure your bearer token in settings.");
+      return;
+    }
+
+    const hasInput = downloadType === "magnet" ? magnetLink.trim() : torrentFileBytes;
+    if (!hasInput) {
+      alert(`Please provide a ${downloadType} link or file.`);
+      return;
+    }
+
+    const downloadId = `dl-${++downloadCounterRef.current}`;
+    const requestEntry: RequestEntry = {
+      id: downloadId,
+      status: "in-progress",
+      statusMessage: "Starting request...",
+      result: null,
+      createdAt: Date.now(),
+      bytesDownloaded: 0,
+      totalBytes: 0,
+    };
+
+    setDownloads((cur) => [...cur, requestEntry]);
+    setIsWorking(true);
+
+    const payload: StartLinkRequest = {
+      magnetLink: downloadType === "magnet" ? magnetLink.trim() || undefined : undefined,
+      torrentFileName: downloadType === "torrent" ? torrentFileName || undefined : undefined,
+      torrentFileBytes: downloadType === "torrent" ? torrentFileBytes : undefined,
+      suggestedFileName: suggestedFileName.trim() || undefined,
+      allowZip: true,
+      asQueued: false,
+    };
+
+    try {
+      const result = await invoke<LinkRequestResult>("start_link_request", {
+        request: payload,
+      });
+
+      setDownloads((cur) =>
+        cur.map((d) =>
+          d.id === downloadId
+            ? {
+                ...d,
+                status: "completed",
+                result,
+                statusMessage: result.detail,
+              }
+            : d
+        )
+      );
+
+      // Reset form
+      setMagnetLink("");
+      setTorrentFileName("");
+      setTorrentFileBytes(undefined);
+      setSuggestedFileName("");
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : "Download failed.";
+      setDownloads((cur) =>
+        cur.map((d) =>
+          d.id === downloadId
+            ? {
+                ...d,
+                status: "failed",
+                statusMessage: errorMessage,
+              }
+            : d
+        )
+      );
+    } finally {
+      setIsWorking(false);
+    }
+  }
+
   async function startDownload() {
     if (!settings.bearerToken.trim()) {
       alert("Please configure your bearer token in settings.");
@@ -198,7 +289,7 @@ function App() {
     }
 
     const downloadId = `dl-${++downloadCounterRef.current}`;
-    const downloadEntry: DownloadEntry = {
+    const requestEntry: RequestEntry = {
       id: downloadId,
       status: "in-progress",
       statusMessage: "Starting download...",
@@ -208,8 +299,8 @@ function App() {
       totalBytes: 0,
     };
 
-    setDownloads((cur) => [...cur, downloadEntry]);
-    setIsDownloading(true);
+    setDownloads((cur) => [...cur, requestEntry]);
+    setIsWorking(true);
 
     const payload: StartDownloadRequest = {
       magnetLink: downloadType === "magnet" ? magnetLink.trim() || undefined : undefined,
@@ -258,28 +349,30 @@ function App() {
         )
       );
     } finally {
-      setIsDownloading(false);
+      setIsWorking(false);
     }
   }
 
   return (
     <div className="app-container">
       {/* Header with Settings Button */}
-      <header className="app-header">
-        <div className="header-content">
-          <div>
-            <h1 className="app-title">Torbox Download Client</h1>
+      <div className="header-wrapper">
+        <header className="app-header">
+          <div className="header-content">
+            <div>
+              <h1 className="app-title">Torbox Download Client</h1>
+            </div>
           </div>
-        </div>
-      </header>
-      
-      <button
-        className="settings-toggle"
-        onClick={() => setSettingsPanelOpen(!settingsPanelOpen)}
-        aria-label={settingsPanelOpen ? "Close settings" : "Open settings"}
-      >
-        {settingsPanelOpen ? "✕" : "⚙"}
-      </button>
+        </header>
+        
+        <button
+          className="settings-toggle"
+          onClick={() => setSettingsPanelOpen(!settingsPanelOpen)}
+          aria-label={settingsPanelOpen ? "Close settings" : "Open settings"}
+        >
+          {settingsPanelOpen ? "✕" : "⚙"}
+        </button>
+      </div>
 
       {/* Settings Panel (Fold out from top right) */}
       <div className={`settings-panel ${settingsPanelOpen ? "open" : "closed"}`}>
@@ -327,7 +420,7 @@ function App() {
             <div className="empty-state">No downloads yet. Start one on the right.</div>
           ) : (
             <div className="downloads-list">
-              {downloads.map((dl) => (
+              {[...downloads].reverse().map((dl) => (
                 <div key={dl.id} className={`download-card status-${dl.status}`}>
                   <div className="download-header">
                     <div className="status-badge">{dl.status}</div>
@@ -354,7 +447,7 @@ function App() {
                     </div>
                   )}
                   
-                  {dl.result && (
+                  {dl.result && "bytesWritten" in dl.result && (
                     <div className="download-details">
                       <div className="detail-row">
                         <span className="label">Torrent ID:</span>
@@ -367,6 +460,36 @@ function App() {
                       <div className="detail-row">
                         <span className="label">Path:</span>
                         <span className="value path">{dl.result.outputPath}</span>
+                      </div>
+                    </div>
+                  )}
+
+                  {dl.result && "downloadUrl" in dl.result && (
+                    <div className="download-details">
+                      <div className="detail-row">
+                        <span className="label">Download URL:</span>
+                        <div className="actions-row">
+                          <button
+                            className="secondary-button"
+                            onClick={() => {
+                              navigator.clipboard.writeText((dl.result as LinkRequestResult).downloadUrl);
+                            }}
+                          >
+                            Copy
+                          </button>
+                          <button
+                            className="secondary-button"
+                            onClick={() => {
+                              openUrl((dl.result as LinkRequestResult).downloadUrl);
+                            }}
+                          >
+                            Open
+                          </button>
+                        </div>
+                      </div>
+                      <div className="detail-row">
+                        <span className="label">Detail:</span>
+                        <span className="value">{dl.result.detail}</span>
                       </div>
                     </div>
                   )}
@@ -462,15 +585,27 @@ function App() {
             />
           </label>
 
-          {/* Start Download Button */}
-          <button
-            className="primary-button start-download-btn"
-            type="button"
-            onClick={startDownload}
-            disabled={isDownloading}
-          >
-            {isDownloading ? "Downloading..." : "Start Download"}
-          </button>
+          <div className="actions-row">
+            {/* Start Download Button */}
+            <button
+              className="primary-button start-download-btn"
+              type="button"
+              onClick={startDownload}
+              disabled={isWorking}
+            >
+              {isWorking ? "Working..." : "Start Download"}
+            </button>
+
+            {/* Start Link Request Button */}
+            <button
+              className="primary-button start-download-btn"
+              type="button"
+              onClick={startRequestLink}
+              disabled={isWorking}
+            >
+              {isWorking ? "..." : "Get Link"}
+            </button>
+          </div>
         </section>
       </main>
     </div>

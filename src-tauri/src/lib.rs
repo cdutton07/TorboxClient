@@ -3,6 +3,7 @@ use std::{fs, io::ErrorKind, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::Emitter;
+use tauri_plugin_opener;
 use human_bytes::human_bytes;
 // event emission uses `AppHandle::emit`
 
@@ -31,10 +32,29 @@ pub struct StartDownloadRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct StartLinkRequest {
+    pub magnet_link: Option<String>,
+    pub torrent_file_name: Option<String>,
+    pub torrent_file_bytes: Option<Vec<u8>>,
+    pub suggested_file_name: Option<String>,
+    pub allow_zip: Option<bool>,
+    pub as_queued: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DownloadResult {
     pub torrent_id: String,
     pub output_path: String,
     pub bytes_written: u64,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkRequestResult {
+    pub torrent_id: String,
+    pub download_url: String,
     pub detail: String,
 }
 
@@ -494,12 +514,141 @@ async fn start_download(app: tauri::AppHandle, request: StartDownloadRequest) ->
     .await
 }
 
+#[tauri::command]
+async fn start_link_request(app: tauri::AppHandle, request: StartLinkRequest) -> Result<LinkRequestResult, String> {
+    let settings = load_settings_from_disk()?;
+
+    if settings.bearer_token.trim().is_empty() {
+        return Err("Save a bearer token in settings before starting a link request.".to_string());
+    }
+
+    let magnet_link = request.magnet_link.as_ref().and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+
+    let torrent_file_bytes = request.torrent_file_bytes.clone();
+
+    if magnet_link.is_none() && torrent_file_bytes.is_none() {
+        return Err("Provide either a magnet link or a torrent file.".to_string());
+    }
+
+    let client = build_torbox_client(&settings.bearer_token)?;
+
+    let _ = app.emit("download-status", "Submitting torrent to TorBox (createtorrent)");
+    let mut form = reqwest::multipart::Form::new()
+        .text("allow_zip", request.allow_zip.unwrap_or(true).to_string())
+        .text("as_queued", request.as_queued.unwrap_or(false).to_string())
+        .text("add_only_if_cached", false.to_string());
+
+    if let Some(name) = request
+        .suggested_file_name
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        form = form.text("name", name.to_string());
+    }
+
+    if let Some(magnet) = magnet_link {
+        form = form.text("magnet", magnet);
+    }
+
+    if let Some(bytes) = torrent_file_bytes {
+        let file_name = request
+            .torrent_file_name
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "upload.torrent".to_string());
+
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(file_name)
+            .mime_str("application/x-bittorrent")
+            .map_err(|error| format!("Failed to prepare torrent file upload: {error}"))?;
+
+        form = form.part("file", part);
+    }
+
+    let create_response = client
+        .post(format!("{TORBOX_BASE_URL}/v1/api/torrents/createtorrent"))
+        .bearer_auth(&settings.bearer_token)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|error| format!("Failed to create torrent: {error}"))?;
+
+    let create_status = create_response.status();
+    let create_content_type = create_response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+
+    if create_content_type.contains("application/json") {
+        let envelope: TorboxEnvelope<Value> = create_response
+            .json()
+            .await
+            .map_err(|error| format!("Failed to decode TorBox response: {error}"))?;
+
+        if !envelope.success {
+            return Err(torbox_error_message(
+                envelope,
+                &format!("TorBox rejected the torrent request ({create_status})."),
+            ));
+        }
+
+        let torrent_id = envelope
+            .data
+            .as_ref()
+            .and_then(extract_torrent_id)
+            .ok_or_else(|| "TorBox did not return a torrent id.".to_string())?;
+        let _ = app.emit("download-status", format!("TorBox created torrent id {}", torrent_id));
+
+        let download_url = request_download_url(&client, &settings.bearer_token, &torrent_id, request.allow_zip.unwrap_or(true), &app).await?;
+
+        return Ok(LinkRequestResult {
+            torrent_id: torrent_id.to_string(),
+            download_url,
+            detail: "Successfully created torrent and requested download URL.".to_string(),
+        })
+    }
+
+    if !create_status.is_success() {
+        return Err(format!("TorBox rejected the torrent request ({create_status})."));
+    }
+
+    let torrent_id = create_response
+        .text()
+        .await
+        .map_err(|error| format!("Failed to read TorBox response: {error}"))?;
+
+    let torrent_id = torrent_id.trim();
+    if torrent_id.is_empty() {
+        return Err("TorBox did not return a torrent id.".to_string());
+    }
+
+    let _ = app.emit("download-status", format!("TorBox created torrent id {}", torrent_id));
+
+    let download_url = request_download_url(&client, &settings.bearer_token, &torrent_id, request.allow_zip.unwrap_or(true), &app).await?;
+
+    Ok(LinkRequestResult {
+        torrent_id: torrent_id.to_string(),
+        download_url,
+        detail: "Successfully created torrent and requested download URL.".to_string(),
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
     .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![load_settings, save_settings, start_download])
+        .invoke_handler(tauri::generate_handler![load_settings, save_settings, start_download, start_link_request])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
